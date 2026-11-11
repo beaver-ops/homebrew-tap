@@ -1,0 +1,67 @@
+# Keeps Formula/beaver.rb on the latest release of beaver-ops/beaver-cli: every 30 minutes (and by hand),
+# reads the latest release through the public GitHub API; when it is newer than the formula's version,
+# rewrites the version, URLs and sha256 (from the release's checksums.txt) and commits to main with this
+# repo's GITHUB_TOKEN. Nothing outside this repository is written.
+name: Update formula
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+env:
+  RELEASE_REPO: beaver-ops/beaver-cli
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # No release yet → 404: nothing to do.
+          if ! release=$(gh api "repos/$RELEASE_REPO/releases/latest" 2>/dev/null); then
+            echo "No release of $RELEASE_REPO yet"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag=$(jq -r .tag_name <<<"$release")
+          version=${tag#v}
+          [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected tag $tag"; exit 1; }
+          # The formula's version is the one in its URLs (.../releases/download/v<version>/...).
+          current=$(sed -nE 's#.*/releases/download/v([0-9]+\.[0-9]+\.[0-9]+)/.*#\1#p' Formula/beaver.rb | head -n1)
+          echo "Latest $version, formula ${current:-none}"
+          newest=$(printf '%s\n%s\n' "$version" "${current:-0.0.0}" | sort -V | tail -n1)
+          if [ "$version" = "${current:-}" ] || [ "$newest" != "$version" ]; then
+            echo "Formula is up to date"
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -e '.assets[] | select(.name == "checksums.txt")' <<<"$release" >/dev/null || { echo "Release $tag has no checksums.txt yet"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Rewrite Formula/beaver.rb
+        if: steps.latest.outputs.version != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/checksums.txt" "https://github.com/$RELEASE_REPO/releases/download/v$VERSION/checksums.txt"
+          scripts/formula.sh "$VERSION" "$RUNNER_TEMP/checksums.txt" > "$RUNNER_TEMP/beaver.rb"
+          ruby -c "$RUNNER_TEMP/beaver.rb"
+          mv "$RUNNER_TEMP/beaver.rb" Formula/beaver.rb
+          git diff --stat
+      - name: Commit
+        if: steps.latest.outputs.version != ''
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/beaver.rb
+          git diff --cached --quiet && { echo "Formula unchanged"; exit 0; }
+          git commit -m "beaver $VERSION"
+          git push origin HEAD:main
